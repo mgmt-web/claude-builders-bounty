@@ -1,54 +1,78 @@
 # Destructive Bash Guard for Claude Code
 
-A lightweight `PreToolUse` hook that blocks destructive Bash commands before Claude Code executes them.
+A dependency-free `PreToolUse` hook that stops destructive Bash commands before Claude Code executes them.
 
-## What it blocks
+## Acceptance criteria
 
-- `rm -rf` (including combined flags such as `rm -fr`)
+The guard blocks:
+
+- `rm -rf`, `rm -fr`, split flags such as `rm -r -f`, and long-form recursive/force flags
 - `DROP TABLE`
-- `git push --force`, `git push --force-with-lease`, and `git push -f`
-- `TRUNCATE` / `TRUNCATE TABLE`
-- `DELETE FROM ...` when the statement has no `WHERE` clause
+- `git push --force`, `git push -f`, and `--force-with-lease`
+- `TRUNCATE`
+- `DELETE FROM ...` when that SQL statement has no `WHERE` clause
 
-Every blocked attempt is appended to `~/.claude/hooks/blocked.log`. Each entry contains a UTC timestamp, attempted command, project path, and blocking reason.
+Every blocked attempt is appended to `~/.claude/hooks/blocked.log` as JSON Lines with:
 
-## Install — 2 commands
+- UTC timestamp
+- attempted command
+- project path
+- blocking reason
+
+Claude receives a structured `PreToolUse` deny decision explaining why the command was blocked.
+
+## Install — one command
+
+From the repository root:
 
 ```bash
-mkdir -p ~/.claude/hooks && cp .claude/hooks/destructive_bash_guard.py ~/.claude/hooks/destructive_bash_guard.py && chmod +x ~/.claude/hooks/destructive_bash_guard.py
+python bounty-3/install.py
 ```
 
+The installer copies the hook to `~/.claude/hooks/destructive_bash_guard.py`, marks it executable, and adds the Bash `PreToolUse` entry to `~/.claude/settings.json` without deleting existing settings. Running the installer again is safe and does not duplicate the hook entry.
+
+A static configuration example is also available in `bounty-3/settings.example.json`.
+
+## False-positive resistance
+
+The hook parses shell command structure rather than searching the entire string with one regex. That means harmless commands that merely mention dangerous text continue to work:
+
 ```bash
-python - <<'PY'
-import json, pathlib
-p = pathlib.Path.home()/".claude/settings.json"
-d = json.loads(p.read_text()) if p.exists() else {}
-d.setdefault("hooks", {}).setdefault("PreToolUse", []).append({
-    "matcher": "Bash",
-    "hooks": [{"type": "command", "command": str(pathlib.Path.home()/".claude/hooks/destructive_bash_guard.py")}]
-})
-p.parent.mkdir(parents=True, exist_ok=True)
-p.write_text(json.dumps(d, indent=2) + "\n")
-PY
+echo "rm -rf /"
+grep "DROP TABLE" schema.sql
+printf "git push --force origin main"
+psql -c "SELECT 'DROP TABLE users';"
+```
+
+It also recognizes common real execution wrappers:
+
+```bash
+sudo rm -rf /tmp/demo
+env FOO=1 rm --recursive --force build/
+bash -c 'rm -rf /tmp/demo'
 ```
 
 ## Examples
 
 Blocked:
+
 ```bash
-rm -rf build/
-git push --force origin main
+rm -r -f build/
+sudo rm -rf /tmp/demo
+git -C repo push --force-with-lease origin main
 psql -c 'DROP TABLE users'
 sqlite3 app.db 'TRUNCATE TABLE events'
 psql -c 'DELETE FROM users'
 ```
 
 Allowed:
+
 ```bash
 rm build/output.txt
 git push origin feature/safe-branch
 psql -c 'DELETE FROM sessions WHERE expires_at < now()'
-echo "normal command"
+echo "rm -rf /"
+python -m pytest
 ```
 
 ## Test
@@ -57,8 +81,8 @@ echo "normal command"
 python -m unittest -v tests/test_destructive_bash_guard.py
 ```
 
-The test suite covers all required blocked patterns, safe commands, non-Bash calls, logging, and the deny response.
+The suite verifies required destructive patterns, split/long flags, sudo/env/shell wrappers, harmless mentions, SQL string literals, per-statement `WHERE` handling, comments, JSONL logging, Claude's deny response, non-Bash passthrough, and idempotent installation.
 
-## Notes
+## Design note
 
-Pattern matching is a guardrail, not a complete shell parser. Claude Code's normal permission system remains in place for commands the hook does not block.
+This is a focused safety guard, not a complete shell or SQL parser. Commands outside the bounty's destructive patterns still fall through to Claude Code's normal permission system.
